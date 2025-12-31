@@ -1,0 +1,1452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="VIGIYE - Intelligent Surveillance System powered by Huawei Cloud and AI">
+    <meta name="keywords" content="Huawei, Smart Surveillance, Security, Artificial Intelligence">
+    <meta name="author" content="VIGIYE Security Systems">
+    <title>VIGIYE - Intelligent Surveillance System</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@300..700&display=swap" rel="stylesheet">
+    <script src="https://www.huaweicloud.com/static/obs-sdk-web/latest/huaweicloud-obs-sdk.min.js"></script>
+    <script src="https://unpkg.com/@huawei/ml-kit-web@latest/dist/ml-kit.js"></script>
+    <script src="https://unpkg.com/@huawei/push-kit-web@latest/dist/push-kit.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script type="module">
+        window.db = null;
+        window.auth = null;
+        window.userId = null;
+        window.isAuthReady = false;
+
+        const DEMO_MODE = true;
+        const BEHAVIOR_TYPES = ['aggressive', 'suspicious', 'theft', 'motion-anomaly'];
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+        const huaweiCloudConfig = {
+            accessKeyId: import.meta.env.VITE_HUAWEI_ACCESS_KEY,
+            secretAccessKey: import.meta.env.VITE_HUAWEI_SECRET_KEY,
+            endpoint: 'https://obs.me-east-1.myhuaweicloud.com',
+            region: 'me-east-1'
+        };
+
+        window.initializeHuaweiCloud = async function() {
+            try {
+                const obsClient = new OBSClient(huaweiCloudConfig);
+                window.obsClient = obsClient;
+
+                if (window.huaweiMLKit && typeof window.huaweiMLKit.init === 'function') {
+                    await window.huaweiMLKit.init({
+                        apiKey: 'demo-ml-kit-key-competition',
+                        region: 'me-east-1'
+                    });
+                }
+
+                if (typeof getHuaweiCameras === 'function') {
+                    try {
+                        window.cameras = await getHuaweiCameras();
+                    } catch(e) {
+                        console.warn('Unable to fetch Huawei cameras at init:', e);
+                        window.cameras = window.cameras || [];
+                    }
+                }
+
+                document.getElementById('loading-status')?.classList.add('hidden');
+                window.renderPage(currentPage);
+
+            } catch (error) {
+                console.error("Huawei Cloud Initialization Error:", error);
+                document.getElementById('loading-status').textContent = `Initialization Error: ${error.message}`;
+            }
+        }
+
+        const getDemoCameras = () => {
+            return [
+                { id: 'cam001', name: 'Entrance Camera', status: 'normal', fps: 25, cloudUrl: 'https://stream.example.com/cam/entrance', coordinates: [0, 0], aiCapabilities: ['motion-anomaly'] },
+                { id: 'cam002', name: 'Corridor Camera', status: 'suspicious', fps: 24, cloudUrl: 'https://stream.example.com/cam/corridor', coordinates: [0, 0], aiCapabilities: ['aggressive'] },
+                { id: 'cam003', name: 'Storage Camera', status: 'dangerous', fps: 20, cloudUrl: 'https://stream.example.com/cam/storage', coordinates: [0, 0], aiCapabilities: ['theft'] },
+                { id: 'cam004', name: 'Interior Camera', status: 'normal', fps: 28, cloudUrl: 'https://stream.example.com/cam/interior', coordinates: [0, 0], aiCapabilities: ['motion-anomaly'] }
+            ];
+        };
+        
+        const getHuaweiCameras = async () => {
+            try {
+                console.log('Attempting to connect to Huawei HoloSens...');
+                const response = await fetch('https://holosens.huawei.com/api/v1/cameras', {
+                    headers: {
+                        'Authorization': `Bearer ${import.meta.env.VITE_HOLOSENS_TOKEN || ''}`,
+                        'Content-Type': 'application/json'
+                    },
+                    timeout: 5000
+                });
+                const cams = await response.json();
+                console.log('Successfully fetched cameras from Huawei HoloSens');
+                return cams.map(cam => ({
+                    id: cam.deviceId,
+                    name: cam.deviceName,
+                    status: cam.status === 'online' ? 'normal' : 'offline',
+                    fps: cam.capabilities?.video?.fps || 25,
+                    cloudUrl: cam.streamUrls?.hls || '',
+                    coordinates: [cam.location?.lat, cam.location?.lng],
+                    aiCapabilities: cam.aiFeatures || []
+                }));
+            } catch (error) {
+                console.warn('Failed to connect to Huawei HoloSens, using demo cameras:', error);
+                return getDemoCameras();
+            }
+        };
+        
+        function showMessage(elementId, message, isError = false) {
+            const messageBox = document.getElementById(elementId);
+            if (!messageBox) return;
+            messageBox.textContent = message;
+            messageBox.classList.remove('hidden', 'bg-red-700', 'text-red-100', 'bg-green-700', 'text-green-100');
+            if (isError) {
+                messageBox.classList.add('bg-red-700', 'text-red-100');
+            } else {
+                messageBox.classList.add('bg-green-700', 'text-green-100');
+            }
+        }
+
+        const HUAWEI_MODEL_NAME = "mindspore/bert-base-arabic";
+        const HUAWEI_API_ENDPOINT = "https://modelarts.me-east-1.myhuaweicloud.com/v1/inferences";
+        const HUAWEI_TOKEN = import.meta.env.VITE_MODELARTS_TOKEN || '';
+
+        const systemPrompt = `You are an intelligent report assistant for the VIGIYE behavior monitoring system. Your task is to analyze raw data to classify behaviors (normal, suspicious, harmful). Generate a concise, professional executive summary in Arabic, clearly including the following points:
+1. Quick count of harmful and suspicious behaviors.
+2. Summary of the most dangerous events (harmful behaviors).
+3. Immediate procedural recommendations based on the results (e.g., security notification, video review, ignore).
+Do not add any sources or expect internet access.`;
+
+        async function callLlmApi(userQuery) {
+            const payload = {
+                model_name: HUAWEI_MODEL_NAME,
+                inputs: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user", content: userQuery }
+                ],
+                parameters: {
+                    max_tokens: 1000,
+                    temperature: 0.3
+                }
+            };
+
+            const headers = {
+                'Content-Type': 'application/json',
+                'X-Auth-Token': HUAWEI_TOKEN,
+                'X-Project-Id': 'vigive-demo-project'
+            };
+
+            if (!HUAWEI_TOKEN || HUAWEI_TOKEN === 'YOUR_MODELARTS_TOKEN') {
+                showMessage('messageBox', "Please update 'HUAWEI_TOKEN' to enable ModelArts connection. Currently simulating.", true);
+                return { text: `**[Huawei AI Report]**
+
+Data analyzed using Huawei ModelArts (simulation).` };
+            }
+
+            try {
+                const response = await fetch(HUAWEI_API_ENDPOINT, {
+                    method: 'POST',
+                    headers: headers,
+                    body: JSON.stringify(payload)
+                });
+                const result = await response.json();
+                return { text: result.outputs?.[0]?.content || JSON.stringify(result) };
+            } catch (error) {
+                console.error("Huawei ModelArts Error:", error);
+                return { text: `**[Huawei AI Report]**
+
+Data analyzed using Huawei ModelArts...` };
+            }
+        }
+
+        async function saveReportToHuaweiCloud(rawInput, smartReport) {
+            if (!window.obsClient) {
+                showMessage('messageBox', "Error: Huawei Cloud not set up.", true);
+                return;
+            }
+
+            const reportData = {
+                rawInput: rawInput,
+                smartReport: smartReport,
+                createdAt: new Date().toISOString(),
+                userId: window.userId,
+                branch: currentBranch
+            };
+
+            try {
+                await window.obsClient.putObject({
+                    Bucket: 'vigive-reports',
+                    Key: `reports/${Date.now()}-${window.userId || 'anon'}.json`,
+                    Body: JSON.stringify(reportData),
+                    ContentType: 'application/json'
+                });
+                showMessage('messageBox', "Report saved to Huawei Cloud successfully!");
+            } catch (error) {
+                console.error("Error saving to Huawei OBS:", error);
+                showMessage('messageBox', `Save error: ${error.message}`, true);
+            }
+        }
+
+        function listenForReports() {
+            return null;
+        }
+        
+        function setupReportsListeners() {
+            const rawDataInput = document.getElementById('rawData');
+            const generateButton = document.getElementById('generateReportButton');
+            const outputMessage = document.getElementById('outputMessage');
+            const generatedReportDiv = document.getElementById('generatedReport');
+
+            if (!rawDataInput || !generateButton) return;
+
+            listenForReports();
+
+            const updateButtonState = () => {
+                generateButton.disabled = rawDataInput.value.trim().length === 0 || !window.isAuthReady;
+            };
+
+            updateButtonState();
+
+            generateButton.onclick = async () => {
+                const rawData = rawDataInput.value.trim();
+                if (!rawData) {
+                    showMessage('messageBox', "Please enter raw behavior data before generation.", true);
+                    return;
+                }
+
+                generateButton.disabled = true;
+                generateButton.innerHTML = `<svg class="animate-spin -mr-1 ml-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Generating...`;
+                outputMessage.textContent = 'Analyzing and summarizing data using language model...';
+                generatedReportDiv.classList.add('hidden');
+                showMessage('messageBox', '', false);
+                
+                try {
+                    const result = await callLlmApi(rawData);
+
+                    if (result && result.text) {
+                        const smartReport = result.text;
+                        generatedReportDiv.textContent = smartReport;
+                        generatedReportDiv.classList.remove('hidden');
+                        outputMessage.textContent = 'Generated successfully.';
+                        await saveReportToHuaweiCloud(rawData, smartReport);
+                    } else if (result !== null) {
+                        throw new Error("Failed to generate smart report.");
+                    }
+
+                } catch (error) {
+                    console.error("Critical Generation Error:", error);
+                    showMessage('messageBox', `Process failed: ${error.message}`, true);
+                    outputMessage.textContent = 'Generation failed. See above message.';
+                    generatedReportDiv.classList.add('hidden');
+                } finally {
+                    generateButton.disabled = false;
+                    generateButton.innerHTML = `Generate Smart Report and Analysis`;
+                }
+            };
+
+            rawDataInput.oninput = updateButtonState;
+        }
+    </script>
+    <style>
+        :root {
+            --bg-dark: #0A0F2C;
+            --primary-blue: #f4feff;
+            --secondary-blue: #00B2FF;
+            --primary: var(--primary-blue);
+            --card-bg: rgba(16, 25, 68, 0.5);
+            --border-color: rgba(0, 240, 255, 0.2);
+            --normal: #5bff76;
+            --suspicious: #ffea76;
+            --dangerous: #ff608d;
+        }
+        
+        body {
+            background-color: var(--bg-dark);
+            color: #e0f2fe;
+        }
+        
+        .neon-glow-card {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            box-shadow: 0 0 15px rgba(0, 240, 255, 0.2);
+            -webkit-backdrop-filter: blur(4px);
+            backdrop-filter: blur(4px);
+            border-radius: 1.5rem;
+            transition: all 0.3s ease;
+        }
+        .neon-glow-card:hover {
+             box-shadow: 0 0 20px rgba(0, 240, 255, 0.5);
+        }
+
+        .gauge-container {
+            width: 200px;
+            height: 200px;
+            margin: 0 auto;
+            position: relative;
+        }
+
+        .gauge-bg {
+            background: conic-gradient(
+                var(--dangerous) 0%, var(--dangerous) 0%,
+                var(--suspicious) 0%, var(--suspicious) 0%,
+                var(--normal) 0%, var(--normal) 100%
+            );
+            border-radius: 50%;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 0 40px var(--primary-blue);
+            transition: background 1s ease-in-out;
+        }
+
+        .gauge-inner {
+            width: 85%;
+            height: 85%;
+            background-color: var(--bg-dark);
+            border-radius: 50%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            padding: 1rem;
+        }
+
+        .nav-active {
+            color: var(--primary);
+            border-bottom: 2px solid var(--primary);
+            text-shadow: 0 0 5px var(--primary);
+        }
+
+        .modal {
+            transition: opacity 0.3s ease, visibility 0.3s ease;
+        }
+        .modal-content {
+            transform: scale(0.95);
+            transition: transform 0.3s ease;
+            background-color: rgba(10, 15, 44, 0.9);
+            border: 1px solid var(--primary-blue);
+            box-shadow: 0 0 20px rgba(0, 240, 255, 0.5);
+        }
+        .modal.open .modal-content {
+            transform: scale(1);
+        }
+        
+        .top-icon-active {
+            background-color: var(--card-bg); 
+            color: var(--primary) !important;
+            box-shadow: 0 0 10px rgba(0, 240, 255, 0.4);
+            border-radius: 0.75rem;
+        }
+        
+        #reports-list::-webkit-scrollbar { width: 8px; }
+        #reports-list::-webkit-scrollbar-thumb { background-color: var(--primary-blue); border-radius: 4px; }
+        #reports-list::-webkit-scrollbar-track { background-color: rgba(0, 0, 0, 0.3); }
+        
+        button, input[type="submit"], .btn-primary {
+            border-radius: 9999px !important;
+            padding: 0.75rem 1.5rem;
+            font-weight: 700;
+            transition: all 0.3s ease;
+            border: none;
+            background-color: var(--secondary-blue);
+            color: var(--bg-dark);
+            box-shadow: 0 0 10px rgba(0, 178, 255, 0.5);
+        }
+        button:hover, .btn-primary:hover {
+            background-color: var(--primary-blue);
+            box-shadow: 0 0 15px var(--primary-blue);
+            color: var(--bg-dark);
+        }
+        
+        .interactive-strip {
+            background: linear-gradient(90deg, var(--secondary-blue), var(--primary-blue));
+            border-radius: 10px;
+            padding: 0.5rem;
+            box-shadow: 0 0 10px rgba(0, 178, 255, 0.5);
+        }
+
+        input:not([type="checkbox"]):not([type="range"]), textarea, select {
+            background-color: rgba(17, 24, 39, 0.5) !important;
+            border: 1px solid var(--border-color) !important;
+            color: #e0f2fe !important;
+        }
+        input:focus, textarea:focus, select:focus {
+            outline: none !important;
+            border-color: var(--primary-blue) !important;
+            box-shadow: 0 0 5px var(--primary-blue) !important;
+        }
+
+        header.neon-glow-card {
+            min-height: 88px;
+            height: 88px;
+            display: flex;
+            align-items: center;
+        }
+
+        .logo-container {
+            flex: 0 0 auto;
+            display: flex;
+            align-items: center;
+        }
+
+        .header-logo {
+            width: 250px;
+            height: 250px;
+            flex: 0 0 auto;
+            object-fit: contain;
+        }
+        
+        :root {
+            --huawei-red: #FF0D00;
+            --huawei-dark: #000000;
+            --huawei-light: #FFFFFF;
+        }
+
+        .huawei-glow {
+            box-shadow: 0 0 15px rgba(255, 13, 0, 0.3);
+            border: 1px solid rgba(255, 13, 0, 0.2);
+        }
+    </style>
+</head>
+
+<body class="text-gray-100 min-h-screen p-4 md:p-8">
+
+    <header class="flex flex-col md:flex-row justify-between items-center mb-8 p-4 neon-glow-card rounded-3xl">
+        <div class="flex items-center space-x-4 space-x-reverse logo-container">
+            <img id="header-logo" src="logo-black-background.png"  alt="h-100 w-100" class="header-logo">
+        </div>
+
+            <img src="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTEyIDIyQzE3LjUyMjggMjIgMjIgMTcuNTIyOCAyMiAxMkMyMiA2LjQ3NzE1IDE3LjUyMjggMiAxMiAyQzYuNDc3MTUgMiAyIDYuNDc3MTUgMiAxMkMyIDE3LjUyMjggNi40NzcxNSAyMiAxMiAyMloiIGZpbGw9IiNGRjBEMDAiLz4KPHBhdGggZD0iTTEyIDZWOE0xMiAxNlYxOE0xNS45NSA5Ljk1TDE0LjUzIDExLjM3TTguMDUgMTUuOTVMOS40NyAxNC41M00xNS45NSAxNC4wNUwxNC41MyAxMi42M004LjA1IDguMDVMOS40NyA5LjQ3IiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K" alt="Huawei" class="huawei-logo">
+        <div id="demo-badge" class="text-xs text-yellow-300 hidden">Demo Mode</div>
+        <nav class="mt-4 md:mt-0 space-x-4 space-x-reverse text-gray-400 text-sm hidden">
+            <a href="#" id="nav-dashboard" onclick="handleNavigation('dashboard')" class="hover:text-primary transition py-1">Dashboard</a>
+            <a href="#" id="nav-statistics" onclick="handleNavigation('statistics')" class="hover:text-primary transition py-1">Statistics</a>
+            <a href="#" id="nav-about" onclick="handleNavigation('about')" class="hover:text-primary transition py-1">About</a>
+            <a href="#" id="nav-settings" onclick="handleNavigation('settings')" class="hover:text-primary transition py-1">Settings</a>
+            <a href="#" id="nav-logout" onclick="handleNavigation('logout')" class="text-red-400 hover:text-red-300 transition py-1 ml-4">Logout</a>
+        </nav>
+    </header>
+
+  
+
+    <main id="main-content-wrapper" class="p-4 md:p-0"></main>
+
+    <div id="camera-modal" class="modal fixed inset-0 bg-black bg-opacity-80 z-50 flex items-center justify-center opacity-0 invisible" onclick="closeCameraModal(event)">
+        <div class="modal-content rounded-3xl shadow-2xl w-11/12 max-w-5xl overflow-hidden" onclick="event.stopPropagation()">
+                <div class="p-4 flex justify-between items-center border-b border-gray-700">
+                <h3 id="modal-title" class="text-xl font-bold text-white">Live Stream - [Camera Name]</h3>
+                <button onclick="closeCameraModal()" class="text-gray-400 hover:text-primary-blue transition rounded-full p-2" title="Close" aria-label="Close Window">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
+                </button>
+            </div>
+            
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 p-4">
+                <div class="md:col-span-2 bg-gray-900/50 rounded-xl aspect-video flex items-center justify-center relative group border border-primary-blue/30">
+                    <video id="modal-video" class="w-full h-full object-cover rounded-lg" playsinline preload="metadata"></video>
+                    <button class="absolute bottom-2 left-2 p-2 bg-black bg-opacity-50 text-white rounded-full opacity-0 group-hover:opacity-100 transition duration-300" onclick="alert('Fullscreen mode simulation')" title="Fullscreen" aria-label="Fullscreen">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4m0 0h4M4 4l5 5m11-4v4m0 0h-4m4 0l-5 5m-5 9l-5-5m0 0v4m0-4h4m11 0l-5-5m5 5v-4m0 4h-4" /></svg>
+                    </button>
+                </div>
+
+                <div class="md:col-span-1 neon-glow-card p-4 rounded-xl space-y-4">
+                    <h4 class="font-bold text-lg border-b border-primary-blue/50 pb-2 text-primary-blue">Current Camera Statistics</h4>
+
+                    <div class="p-3 bg-gray-900/50 rounded-lg">
+                        <p class="text-sm text-gray-400">Camera Name</p>
+                        <p id="modal-camera-name" class="text-xl font-bold text-white">-</p>
+                    </div>
+                    <div class="p-3 bg-gray-900/50 rounded-lg">
+                        <p class="text-sm text-gray-400">Status</p>
+                        <p id="modal-camera-status" class="text-xl font-bold text-red-400">-</p>
+                    </div>
+                    <div class="p-3 bg-gray-900/50 rounded-lg">
+                        <p class="text-sm text-gray-400">Frame Rate</p>
+                        <p id="modal-camera-fps" class="text-xl font-bold text-yellow-400">- FPS</p>
+                    </div>
+                    <div class="p-3 bg-gray-900/50 rounded-lg">
+                        <p class="text-sm text-gray-400">Total Alerts</p>
+                        <p id="modal-camera-alerts" class="text-xl font-bold text-white">-</p>
+                    </div>
+
+                    <button class="w-full btn-primary mt-2" onclick="handleNavigation('statistics')">View Detailed Report</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let currentInterval = null; 
+        let isLoggedIn = false; 
+        let currentPage = 'login'; 
+        let currentBranch = 'enterprise';
+        
+        let cameras = window.cameras || [];
+
+        const branchData = {
+            enterprise: {
+                title: 'Workplace Security & Access Monitoring',
+                alerts: 15, dangerous: 3, suspicious: 7, normal: 5,
+                keyFocus: 'Facility Management & Access Monitoring'
+            },
+            retail: {
+                title: 'Customer Analytics & Inventory Protection',
+                alerts: 45, dangerous: 1, suspicious: 12, normal: 32,
+                keyFocus: 'Customer Analytics & Theft Prevention'
+            },
+            education: {
+                title: 'School Security & Bullying Detection',
+                alerts: 8, dangerous: 2, suspicious: 4, normal: 2,
+                keyFocus: 'Bullying Detection & Student Safety'
+            },
+            residential: {
+                title: 'Home Monitoring & Smart Integration',
+                alerts: 3, dangerous: 0, suspicious: 1, normal: 2,
+                keyFocus: 'Family Alerts & Smart Home Integration'
+            }
+        };
+
+        function getBranchContentHTML(branchKey) {
+            const data = branchData[branchKey];
+            if (!data) return '';
+            
+            return `
+                <div class="space-y-4">
+                    <div class="p-4 bg-blue-900/50 rounded-lg border-r-4 border-primary-blue">
+                        <p class="font-bold text-xl text-primary-blue">${data.title}</p>
+                        <p class="text-sm text-gray-400 mt-1">Primary Focus: ${data.keyFocus}</p>
+                    </div>
+
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        <div class="p-4 bg-gray-900/50 rounded-3xl text-center shadow-inner">
+                            <p class="text-sm text-gray-400">Total Alerts (24h)</p>
+                            <p class="text-3xl font-extrabold text-white">${data.alerts}</p>
+                        </div>
+                        <div class="p-4 bg-gray-900/50 rounded-3xl text-center shadow-inner">
+                            <p class="text-sm text-gray-400">Harmful Behaviors (Dangerous)</p>
+                            <p class="text-3xl font-extrabold text-red-400">${data.dangerous}</p>
+                        </div>
+                        <div class="p-4 bg-gray-900/50 rounded-3xl text-center shadow-inner">
+                            <p class="text-sm text-gray-400">Suspicious Behaviors (Suspicious)</p>
+                            <p class="text-3xl font-extrabold text-yellow-400">${data.suspicious}</p>
+                        </div>
+                    </div>
+
+                    <h5 class="text-xl font-bold mt-6 text-gray-200 border-b border-primary-blue/50 pb-2">Live Camera Streams (${branchKey})</h5>
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                        ${[1, 2, 3, 4].map(i => `
+                            <div class="neon-glow-card p-3 rounded-xl shadow-md cursor-pointer hover:bg-gray-700/50 transition" 
+                                 onclick="openCameraModal('Camera ${i} - ${data.title.split(' ')[0]}')">
+                                <p class="text-md font-semibold text-white truncate">Camera ${i}</p>
+                                <p class="text-sm ${i % 3 === 0 ? 'text-red-400' : 'text-green-400'}">Status: ${i % 3 === 0 ? 'Harmful' : 'Normal'}</p>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            `;
+        }
+        
+        function displayBranch(branchKey, element) {
+            currentBranch = branchKey;
+            document.querySelectorAll('.branch-tab').forEach(tab => tab.classList.remove('nav-active'));
+            element.classList.add('nav-active');
+            
+            const contentArea = document.getElementById('branch-content');
+            if (contentArea) {
+                contentArea.innerHTML = getBranchContentHTML(branchKey);
+            }
+        }
+
+        function openCameraModal(cameraName, videoSrc = null) {
+            const liveNameEl = document.getElementById('live-stream-name');
+            const modalTitleEl = document.getElementById('modal-title');
+            if (liveNameEl) liveNameEl.textContent = cameraName || '-';
+            if (modalTitleEl) modalTitleEl.textContent = `Live Stream - ${cameraName || '-'}`;
+
+            const modal = document.getElementById('camera-modal');
+            const modalVideo = document.getElementById('modal-video');
+            if (modalVideo) {
+                if (videoSrc) {
+                    modalVideo.src = videoSrc;
+                    modalVideo.muted = false;
+                    modalVideo.controls = true;
+                    setTimeout(async () => { try { await modalVideo.play(); } catch(e) {} if (typeof setupHuaweiBehaviorDetection === 'function') { try { setupHuaweiBehaviorDetection(modalVideo); } catch(e){} } }, 50);
+                } else {
+                    try { modalVideo.pause(); } catch(e) {}
+                    modalVideo.removeAttribute('src');
+                    modalVideo.load();
+                    modalVideo.controls = false;
+                }
+            }
+
+            let camObj = null;
+            try {
+                camObj = cameras.find(c => c.name === cameraName || c.id === cameraName);
+            } catch(e) { camObj = null; }
+
+            const nameEl = document.getElementById('modal-camera-name');
+            const statusEl = document.getElementById('modal-camera-status');
+            const fpsEl = document.getElementById('modal-camera-fps');
+            const alertsEl = document.getElementById('modal-camera-alerts');
+
+            if (camObj) {
+                if (nameEl) nameEl.textContent = camObj.name;
+                if (statusEl) statusEl.textContent = camObj.status || '-';
+                if (fpsEl) fpsEl.textContent = (camObj.fps ? camObj.fps + ' FPS' : '- FPS');
+                if (alertsEl) alertsEl.textContent = (camObj.alerts !== undefined ? camObj.alerts : '-') ;
+            } else {
+                if (nameEl) nameEl.textContent = cameraName || '-';
+                if (statusEl) statusEl.textContent = '-';
+                if (fpsEl) fpsEl.textContent = '- FPS';
+                if (alertsEl) alertsEl.textContent = '-';
+            }
+
+            modal.classList.add('open', 'visible', 'opacity-100');
+            modal.classList.remove('invisible', 'opacity-0');
+        }
+
+        function closeCameraModal(event) {
+            if (event && event.target.id !== 'camera-modal') return;
+
+            const modal = document.getElementById('camera-modal');
+            const modalVideo = document.getElementById('modal-video');
+            if (modalVideo) {
+                try { modalVideo.pause(); } catch(e) {}
+                modalVideo.removeAttribute('src');
+                modalVideo.load();
+                modalVideo.controls = false;
+            }
+
+            modal.classList.add('invisible', 'opacity-0');
+            modal.classList.remove('open', 'visible', 'opacity-100');
+        }
+
+        function setupHuaweiBehaviorDetection(videoElement) {
+            if (!window.huaweiMLKit || !videoElement) return;
+            try {
+                const behaviorDetector = new window.huaweiMLKit.BehaviorDetector({
+                    model: 'behavior_analysis_v1',
+                    minConfidence: 0.7
+                });
+
+                videoElement.addEventListener('loadeddata', async () => {
+                    try {
+                        const detections = await behaviorDetector.detect(videoElement);
+                        detections.forEach(detection => {
+                            if (detection.confidence > 0.8) {
+                                handleDetectedBehavior(detection);
+                            }
+                        });
+                    } catch(e) { console.warn('Behavior detection failed:', e); }
+                });
+            } catch (e) { console.warn('setupHuaweiBehaviorDetection error:', e); }
+        }
+
+        function handleDetectedBehavior(detection) {
+            const alert = {
+                type: detection.className === 'aggressive' ? 'dangerous' : 'suspicious',
+                message: `Detected ${detection.className} behavior on camera`,
+                camera: document.getElementById('modal-camera-name')?.textContent || '-',
+                confidence: detection.confidence
+            };
+            addToAlertsList?.(alert);
+            if ('HuaweiPush' in window && typeof window.HuaweiPush.sendNotification === 'function') {
+                try { window.HuaweiPush.sendNotification(alert); } catch(e) { console.warn('HuaweiPush send failed', e); }
+            }
+        }
+
+        function updateActivityGauge(normal, suspicious, dangerous) {
+            const d_perc = dangerous;
+            const s_perc = suspicious;
+            const n_perc = normal;
+            const d_end = d_perc;
+            const s_end = d_perc + s_perc;
+            const n_end = d_perc + s_perc + n_perc; 
+
+            const gauge = document.getElementById('activity-gauge');
+            if (!gauge) return; 
+
+            gauge.style.background = `conic-gradient(
+                var(--dangerous) 0%, var(--dangerous) ${d_end}%,
+                var(--suspicious) ${d_end}%, var(--suspicious) ${s_end}%,
+                var(--normal) ${s_end}%, var(--normal) ${n_end}%
+            )`;
+
+            const updateText = (id, value) => {
+                const el = document.getElementById(id);
+                if (el) el.textContent = `${value.toFixed(0)}%`;
+            };
+
+            updateText('normal-percent', normal);
+            updateText('normal-text', normal);
+            updateText('suspicious-text', suspicious);
+            updateText('dangerous-text', dangerous);
+        }
+
+        function renderAlerts(alerts) {
+            const list = document.getElementById('alerts-list');
+            if (!list) return;
+
+            list.innerHTML = '';
+            
+            const alertCount = document.getElementById('alert-count');
+            if (alertCount) alertCount.textContent = alerts.length;
+
+            alerts.forEach(alert => {
+                const typeClass = alert.type === 'dangerous' ? 'red' : 'yellow';
+                const bgColor = alert.type === 'dangerous' ? 'bg-red-900/40' : 'bg-yellow-900/40';
+                const borderColor = alert.type === 'dangerous' ? 'border-red-700/60' : 'border-yellow-700/60';
+                const textColor = alert.type === 'dangerous' ? 'text-red-400' : 'text-yellow-400';
+                
+                const alertItem = document.createElement('li');
+                alertItem.className = `p-3 rounded-xl ${bgColor} border ${borderColor} text-sm flex items-center justify-between`;
+                
+                alertItem.innerHTML = `
+                    <div>
+                        <span class="${textColor} font-semibold">${alert.message}</span>
+                        <p class="text-xs text-gray-400 mt-0.5">${alert.camera} - Now</p>
+                    </div>
+                    <button class="text-xs ${textColor} hover:text-white transition px-2 py-0.5 rounded-full border border-current hover:bg-gray-700" onclick="handleAlertAction('${alert.type}', '${alert.message}')">Action</button>
+                `;
+                list.appendChild(alertItem);
+            });
+        }
+
+        function handleAlertAction(type, message) {
+            alert(`Action executed on alert: ${message}
+Type: ${type}`);
+        }
+
+        function simulateLiveData() {
+            let activityData = { normal: 87, suspicious: 11, dangerous: 2 };
+            window.lastActivityData = Object.assign({}, activityData);
+            const maxAlerts = 5;
+
+            let alertsList = [];
+            updateActivityGauge(activityData.normal, activityData.suspicious, activityData.dangerous);
+            renderAlerts(alertsList);
+
+            const fluctuate = (base) => {
+                const change = (Math.random() * 4) - 2; 
+                return Math.max(0, Math.min(100, base + change));
+            };
+
+            const intervalId = setInterval(() => {
+                let newNormal = fluctuate(activityData.normal);
+                let newSuspicious = fluctuate(activityData.suspicious);
+                let newDangerous = fluctuate(activityData.dangerous);
+                let total = newNormal + newSuspicious + newDangerous;
+                activityData.normal = (newNormal / total) * 100;
+                activityData.suspicious = (newSuspicious / total) * 100;
+                activityData.dangerous = (newDangerous / total) * 100;
+                updateActivityGauge(activityData.normal, activityData.suspicious, activityData.dangerous);
+                window.lastActivityData = { normal: activityData.normal, suspicious: activityData.suspicious, dangerous: activityData.dangerous };
+
+                if (DEMO_MODE && Math.random() < 0.3 && Array.isArray(cameras) && cameras.length > 0) {
+                    const camera = cameras[Math.floor(Math.random() * cameras.length)].name;
+                    const type = BEHAVIOR_TYPES[Math.floor(Math.random() * BEHAVIOR_TYPES.length)];
+                    const messages = {
+                        'aggressive': 'Potential aggressive behavior',
+                        'suspicious': 'Suspicious activity noted',
+                        'theft': 'Potential theft attempt',
+                        'motion-anomaly': 'Unusual movement/motion anomaly'
+                    };
+
+                    const newAlert = {
+                        type: type,
+                        message: messages[type] || 'Suspicious event',
+                        camera: camera
+                    };
+
+                    alertsList.unshift(newAlert);
+                    if (alertsList.length > maxAlerts) alertsList.pop();
+                    renderAlerts(alertsList);
+                }
+
+            }, 4000);
+
+            return intervalId;
+        }
+
+        function updateNavLinks(activePage) {
+            document.querySelectorAll('nav a').forEach(link => {
+                link.classList.remove('nav-active');
+            });
+            const activeEl = document.getElementById(`nav-${activePage}`);
+            if(activeEl) activeEl.classList.add('nav-active');
+
+            const nav = document.querySelector('header nav');
+            nav.classList.toggle('hidden', !isLoggedIn);
+        }
+
+        let demoChart = null;
+        let demoChartInterval = null;
+
+        function initStatisticsChart() {
+            const canvas = document.getElementById('alertsChart');
+            if (!canvas) return;
+
+            if (demoChart) demoChart.destroy();
+
+            const labels = ['Normal', 'Suspicious', 'Harmful'];
+            const data = window.lastActivityData || { normal: 85, suspicious: 12, dangerous: 3 };
+
+            demoChart = new Chart(canvas.getContext('2d'), {
+                type: 'pie',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: [data.normal, data.suspicious, data.dangerous],
+                        backgroundColor: ['#5bff76', '#ffea76', '#ff608d']
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { position: 'bottom', labels: { color: '#cbd5e1' } }
+                    }
+                }
+            });
+
+            if (demoChartInterval) clearInterval(demoChartInterval);
+            demoChartInterval = setInterval(() => {
+                const d = window.lastActivityData || data;
+                if (demoChart && demoChart.data && demoChart.data.datasets[0]) {
+                    demoChart.data.datasets[0].data = [d.normal, d.suspicious, d.dangerous];
+                    demoChart.update();
+                }
+            }, 3000);
+        }
+
+        function destroyStatisticsChart() {
+            if (demoChartInterval) { clearInterval(demoChartInterval); demoChartInterval = null; }
+            if (demoChart) { demoChart.destroy(); demoChart = null; }
+        }
+
+        function renderPage(pageName) {
+            currentPage = pageName;
+            
+            if (currentInterval) {
+                clearInterval(currentInterval);
+                currentInterval = null;
+            }
+            if (typeof destroyStatisticsChart === 'function') destroyStatisticsChart();
+            
+            const mainContent = document.getElementById('main-content-wrapper');
+            if (!mainContent) return;
+            
+            if (!isLoggedIn && pageName !== 'login' && pageName !== 'signup') {
+                mainContent.innerHTML = getLoginHTML();
+                updateNavLinks('login');
+                return;
+            }
+            
+            switch (pageName) {
+                case 'login':
+                    mainContent.innerHTML = getLoginHTML();
+                    break;
+                case 'signup':
+                    mainContent.innerHTML = getSignupHTML();
+                    break;
+                case 'dashboard':
+                    mainContent.innerHTML = getDashboardHTML();
+                    currentInterval = simulateLiveData(); 
+                    break;
+                case 'statistics':
+                    mainContent.innerHTML = getStatisticsHTML();
+                    if (window.isAuthReady) setupReportsListeners();
+                    setTimeout(() => initStatisticsChart(), 80);
+                    break;
+                case 'settings':
+                    mainContent.innerHTML = getSettingsHTML();
+                    break;
+                case 'add-camera':
+                    mainContent.innerHTML = getAddCameraHTML();
+                    break;
+                case 'about':
+                    mainContent.innerHTML = getAboutHTML();
+                    break;
+                case 'enterprise':
+                case 'retail':
+                case 'education':
+                case 'residential':
+                    mainContent.innerHTML = getBranchPageHTML(pageName);
+                    break;
+                default:
+                    mainContent.innerHTML = `<div class="text-center py-20"><h2 class="text-4xl text-red-500">404 - Page Not Found</h2></div>`;
+            }
+
+            updateNavLinks(pageName);
+        }
+
+        function handleNavigation(pageName) {
+            if (pageName === 'login-submit' || pageName === 'signup-submit') {
+                isLoggedIn = true;
+                renderPage('dashboard');
+            } else if (pageName === 'logout') {
+                isLoggedIn = false;
+                renderPage('login');
+            } else {
+                renderPage(pageName);
+            }
+        }
+        
+        function fetchStatistics() {
+            const dateFrom = document.getElementById('date-from').value;
+            const dateTo = document.getElementById('date-to').value;
+            const unit = document.getElementById('time-unit').value;
+            
+            if (!dateFrom || !dateTo) {
+                alert('Please select a complete time period.');
+                return;
+            }
+            
+            const suspiciousActivities = [
+                { camera: 'Storage Camera', count: 120 },
+                { camera: 'Entrance Camera', count: 85 },
+                { camera: 'Interior Camera', count: 40 },
+                { camera: 'Corridor Camera', count: 15 },
+            ];
+            
+            suspiciousActivities.sort((a, b) => b.count - a.count);
+
+            let resultHTML = `<p class="text-lg font-semibold text-white mt-4 mb-2">Suspicious Activity Results for Period: ${dateFrom} to ${dateTo} (${unit})</p>`;
+            resultHTML += `<ul class="space-y-2">`;
+            
+            suspiciousActivities.forEach((item, index) => {
+                const color = index === 0 ? 'text-red-400' : 'text-yellow-400';
+                resultHTML += `
+                    <li class="flex justify-between items-center p-3 bg-gray-900/50 rounded-lg border border-primary-blue/30">
+                        <span class="text-gray-300">${index + 1}. ${item.camera}</span>
+                        <span class="${color} font-bold">${item.count} suspicious cases</span>
+                    </li>
+                `;
+            });
+            resultHTML += `</ul>`;
+
+            document.getElementById('statistics-results').innerHTML = resultHTML;
+        }
+
+        function getSignupHTML() {
+            return `
+                <div class="flex items-center justify-center min-h-[calc(100vh-200px)]">
+                    <div class="neon-glow-card p-8 md:p-12 rounded-3xl shadow-2xl w-full max-w-md text-center">
+                        <h2 class="text-3xl font-bold text-white mb-6 bubble-font">Create New Account</h2>
+                        <form class="space-y-4">
+                            <div>
+                                <input type="text" placeholder="Username" 
+                                    class="w-full p-3 rounded-lg text-sm text-white" required>
+                            </div>
+                            <div>
+                                <input type="email" placeholder="Email" 
+                                    class="w-full p-3 rounded-lg text-sm text-white" required>
+                            </div>
+                            <div>
+                                <input type="password" placeholder="Password" 
+                                    class="w-full p-3 rounded-lg text-sm text-white" required>
+                            </div>
+                            <div>
+                                <input type="password" placeholder="Confirm Password" 
+                                    class="w-full p-3 rounded-lg text-sm text-white" required>
+                            </div>
+                            <button type="button" onclick="handleNavigation('signup-submit')" 
+                                class="w-full btn-primary bg-green-600 hover:bg-green-700">
+                                Sign Up
+                            </button>
+                        </form>
+                        <p class="mt-4 text-sm text-gray-400">
+                            Already have an account? <a href="#" onclick="handleNavigation('login')" class="text-primary hover:underline font-semibold">Log In</a>
+                        </p>
+                    </div>
+                </div>
+            `;
+        }
+
+        function getLoginHTML() {
+            return `
+                <div class="flex items-center justify-center min-h-[calc(100vh-200px)]">
+                    <div class="neon-glow-card p-8 md:p-12 rounded-3xl shadow-2xl w-full max-w-md text-center">
+                        <h2 class="text-3xl font-bold text-white mb-6 bubble-font">Log In to VIGIYE</h2>
+                        <form class="space-y-6">
+                            <div>
+                                <input type="email" placeholder="Email or Username" 
+                                    class="w-full p-3 rounded-lg text-sm text-white" required>
+                            </div>
+                            <div>
+                                <input type="password" placeholder="Password" 
+                                    class="w-full p-3 rounded-lg text-sm text-white" required>
+                            </div>
+                            <button type="button" onclick="handleNavigation('login-submit')" 
+                                class="w-full btn-primary">
+                                Log In
+                            </button>
+                        </form>
+                        <p class="mt-4 text-sm text-gray-400">
+                            Don't have an account? <a href="#" onclick="handleNavigation('signup')" class="text-green-400 hover:underline font-semibold">Create Account</a>
+                        </p>
+                    </div>
+                </div>
+            `;
+        }
+
+        function getDashboardHTML() {
+            const renderStreams = () => {
+                return cameras.map((cam) => {
+                    const statusColor = cam.status === 'dangerous' ? 'red' : cam.status === 'suspicious' ? 'yellow' : 'green';
+                    const statusText = cam.status === 'dangerous' ? 'Harmful' : cam.status === 'suspicious' ? 'Suspicious' : 'Normal';
+                    const statusBadgeClass = cam.status === 'dangerous' ? 'bg-red-900/70 border-red-600' : cam.status === 'suspicious' ? 'bg-yellow-900/70 border-yellow-600' : 'bg-green-900/70 border-green-600';
+
+                    return `
+                        <div class=\"neon-glow-card rounded-3xl overflow-hidden shadow-2xl cursor-pointer hover:shadow-primary/50 transition\" onclick=\"openCameraModal('${cam.name}', '${cam.cloudUrl}')\">
+                            <div class=\"aspect-video bg-gray-900/50 flex items-center justify-center text-gray-300 relative border border-gray-700\">
+                                <div class=\"text-center\">
+                                    <p class=\"text-4xl mb-2\">◆</p>
+                                    <p class=\"text-sm font-semibold\">${cam.name}</p>
+                                    <p class=\"text-xs text-gray-400 mt-1\">Live Feed</p>
+                                </div>
+                                <div class=\"absolute top-2 right-2 ${statusBadgeClass} text-white text-xs px-3 py-1 rounded-lg border font-medium\">${statusText}</div>
+                            </div>
+                            <div class=\"p-3 text-sm flex justify-between items-center border-t border-gray-700 bg-gray-900/30\">
+                                <span class=\"text-${statusColor}-400 font-semibold\">${statusText}</span>
+                                <span class=\"text-gray-400 text-xs\">• ${cam.fps} FPS</span>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+            };
+
+            return `
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                    <div class="lg:col-span-1 space-y-8">
+                        <div class="neon-glow-card p-6 rounded-3xl text-center">
+                            <h2 class="text-xl font-bold mb-4 border-b border-primary-blue/50 pb-2 text-primary-blue">Total Activity Level</h2>
+                            <div class="gauge-container">
+                                <div id="activity-gauge" class="gauge-bg">
+                                    <div class="gauge-inner">
+                                        <span id="normal-percent" class="text-2xl font-extrabold text-green-400">87%</span>
+                                        <span class="text-xs text-gray-400">Normal Activity</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="flex justify-around text-xs mt-6">
+                                <div><span class="inline-block w-3 h-3 rounded-full bg-red-600 ml-1"></span><span class="text-red-400 font-medium">Harmful (<span id="dangerous-text">2%</span>)</span></div>
+                                <div><span class="inline-block w-3 h-3 rounded-full bg-yellow-500 ml-1"></span><span class="text-yellow-400 font-medium">Suspicious (<span id="suspicious-text">11%</span>)</span></div>
+                                <div><span class="inline-block w-3 h-3 rounded-full bg-green-600 ml-1"></span><span class="text-green-400 font-medium">Normal (<span id="normal-text">87%</span>)</span></div>
+                            </div>
+                        </div>
+
+                        <div class="neon-glow-card p-6 rounded-3xl">
+                            <h2 class="text-xl font-bold mb-4 border-b border-primary-blue/50 pb-2 flex justify-between items-center text-primary-blue">
+                                Active Alerts
+                                <span id="alert-count" class="bg-red-600 text-white text-sm font-bold px-3 py-1 rounded-full">1</span>
+                            </h2>
+                            <ul id="alerts-list" class="space-y-3 max-h-64 overflow-y-auto"></ul>
+                        </div>
+                    </div>
+
+                    <div class="lg:col-span-2 space-y-6">
+                        <h2 class="text-xl font-bold mb-4">Live Camera Streams (Click to Open)</h2>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-6">
+                            ${renderStreams()}
+                        </div>
+                        
+                        <div class="mt-8">
+                            <h3 class="text-2xl font-bold text-white mb-4 border-b border-primary-blue/50 pb-2">System View by Branch</h3>
+                            <div class="border-b border-gray-700">
+                                <nav class="-mb-px flex space-x-8 space-x-reverse" id="branch-tabs">
+                                    <button onclick="handleNavigation('enterprise')" class="branch-tab py-2 px-1 border-b-2 font-medium text-sm border-transparent text-gray-400 hover:border-primary-blue hover:text-primary-blue nav-active" data-branch="enterprise">Enterprise</button>
+                                    <button onclick="handleNavigation('retail')" class="branch-tab py-2 px-1 border-b-2 font-medium text-sm border-transparent text-gray-400 hover:border-primary-blue hover:text-primary-blue" data-branch="retail">Retail</button>
+                                    <button onclick="handleNavigation('education')" class="branch-tab py-2 px-1 border-b-2 font-medium text-sm border-transparent text-gray-400 hover:border-primary-blue hover:text-primary-blue" data-branch="education">Education</button>
+                                    <button onclick="handleNavigation('residential')" class="branch-tab py-2 px-1 border-b-2 font-medium text-sm border-transparent text-gray-400 hover:border-primary-blue hover:text-primary-blue" data-branch="residential">Residential</button>
+                                </nav>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function getStatisticsHTML() {
+            const mostSuspiciousCamera = 'Storage Camera';
+            const suspiciousCount = '120';
+
+            return `
+                <div class="space-y-8 max-w-6xl mx-auto">
+                    <h2 class="text-3xl font-bold text-white border-b border-primary-blue/50 pb-2 mb-6">Statistics and Performance Analysis</h2>
+                    
+                    <div class="neon-glow-card p-6 rounded-3xl">
+                        <h3 class="text-xl font-bold mb-4 border-b border-primary-blue/50 pb-2 text-primary-blue">Period Selection and Analysis</h3>
+                        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
+                            <div>
+                                <label for="date-from" class="block text-sm font-medium text-gray-300 mb-1">From</label>
+                                <input type="datetime-local" id="date-from" class="w-full p-2 rounded-lg text-sm">
+                            </div>
+                            <div>
+                                <label for="date-to" class="block text-sm font-medium text-gray-300 mb-1">To</label>
+                                <input type="datetime-local" id="date-to" class="w-full p-2 rounded-lg text-sm">
+                            </div>
+                            <div>
+                                <label for="time-unit" class="block text-sm font-medium text-gray-300 mb-1">Unit</label>
+                                <select id="time-unit" class="w-full p-2 rounded-lg text-sm">
+                                    <option value="day">Day</option>
+                                    <option value="hour">Hour</option>
+                                    <option value="minute">Minute</option>
+                                    <option value="second">Second</option>
+                                </select>
+                            </div>
+                            <button onclick="fetchStatistics()" 
+                                class="w-full btn-primary py-2 px-4 font-bold rounded-full">
+                                Analyze Period
+                            </button>
+                        </div>
+                        
+                        <div id="statistics-results" class="mt-6 p-4 border border-primary-blue/30 rounded-xl bg-gray-900/50">
+                            <p class="text-gray-500">Select a time period and press "Analyze Period" to display results here.</p>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+                        <div class="neon-glow-card p-6 rounded-3xl shadow-xl border-t-4 border-primary-blue"><p class="text-sm text-gray-400">Total Alerts</p><p class="text-3xl font-extrabold mt-1 text-white">4,120</p></div>
+                        <div class="neon-glow-card p-6 rounded-3xl shadow-xl border-t-4 border-red-500"><p class="text-sm text-gray-400">Harmful Alerts</p><p class="text-3xl font-extrabold mt-1 text-red-400">215</p></div>
+                        <div class="neon-glow-card p-6 rounded-3xl shadow-xl border-t-4 border-yellow-500"><p class="text-sm text-gray-400">Most Suspicious Camera</p><p class="text-xl font-extrabold mt-1 text-yellow-400">${mostSuspiciousCamera}</p></div>
+                        <div class="neon-glow-card p-6 rounded-3xl shadow-xl border-t-4 border-green-500"><p class="text-sm text-gray-400">Model Classification Accuracy</p><p class="text-3xl font-extrabold mt-1 text-green-400">98.5%</p></div>
+                    </div>
+
+                    <div id="llm-section" class="neon-glow-card p-6 rounded-3xl border border-primary-blue/50">
+                        <h3 class="text-2xl font-bold text-primary-blue mb-4 border-b border-primary-blue/50 pb-2">Smart Report Generator</h3>
+                        
+                        <div>
+                            <label for="rawData" class="block text-sm font-medium text-gray-300 mb-2">Raw Behavior Data (for AI analysis):</label>
+                            <textarea id="rawData" rows="10" 
+                                    class="block w-full p-3 border rounded-lg text-gray-100 transition duration-150"
+                                    placeholder="Example:&#10;[2024-10-25 10:05:30] - Harmful behavior: theft attempt (Area A/Retail).&#10;[2024-10-25 11:15:00] - Suspicious behavior: unusual gathering (Area B/Enterprise).&#10;[2024-10-25 14:00:15] - Normal behavior: routine movements (Entrance/Education).&#10;[2024-10-26 09:20:45] - Harmful behavior: physical assault (Area A/Enterprise)."></textarea>
+                        </div>
+
+                        <button id="generateReportButton" 
+                                class="mt-4 w-full btn-primary focus:ring-4 focus:ring-primary-blue focus:ring-opacity-50 flex items-center justify-center disabled:opacity-50"
+                                disabled>
+                            Generate Smart Report and Analysis
+                        </button>
+
+                        <div id="messageBox" class="mt-4 p-3 hidden rounded-lg text-sm font-semibold" role="alert"></div>
+
+                        <div id="llmOutput" class="mt-6 p-4 bg-gray-900/50 border border-primary-blue/30 rounded-xl min-h-[100px] shadow-inner transition duration-300">
+                            <p class="text-gray-400 text-center" id="outputMessage">Generated smart report will appear here.</p>
+                            <div id="generatedReport" class="text-gray-100 whitespace-pre-wrap hidden"></div>
+                        </div>
+
+                        <div class="mt-8">
+                            <h3 class="text-xl font-bold text-white mb-4 border-b border-primary-blue/50 pb-2">Saved Reports</h3>
+                            <div id="reports-list" class="space-y-4 max-h-[50vh] overflow-y-auto">
+                                <p class="text-gray-500 p-4 text-center">Loading reports...</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="neon-glow-card p-6 rounded-3xl">
+                        <h3 class="text-xl font-bold mb-4 border-b border-primary-blue/50 pb-2 text-primary-blue">Charts and Trends</h3>
+                        <div class="aspect-video bg-gray-900/50 flex items-center justify-center rounded-xl h-96 border border-primary-blue/30 p-4">
+                            <canvas id="alertsChart" class="w-full h-full"></canvas>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function getOriginalSettingsContent() {
+            const renderCamerasList = () => cameras.map(cam => {
+                const statusColor = cam.status === 'dangerous' ? 'red' : 'green';
+                const statusText = cam.status === 'dangerous' ? 'Disconnected' : 'Connected';
+                
+                return `
+                    <div class="flex justify-between items-center p-3 bg-gray-900/50 rounded-lg border border-primary-blue/30">
+                        <span class="text-gray-300">${cam.name}</span>
+                        <span class="text-${statusColor}-400 text-xs">${statusText}</span>
+                    </div>
+                `;
+            }).join('');
+            
+            return `
+                <div class="max-w-4xl mx-auto space-y-8">
+                    <h2 class="text-3xl font-bold text-white border-b border-primary-blue/50 pb-2 mb-6">System Settings</h2>
+
+                    <div class="neon-glow-card p-6 rounded-3xl">
+                        <h3 class="text-xl font-bold mb-4 border-b border-primary-blue/50 pb-2 text-primary-blue">Account Settings</h3>
+                        <form class="space-y-4">
+                            <div>
+                                <label for="email" class="block text-sm font-medium text-gray-300 mb-1">Email (Cannot be changed)</label>
+                                <input type="email" id="email" value="admin@vigive.com" disabled
+                                    class="w-full p-2 rounded-lg text-sm text-gray-400 cursor-not-allowed">
+                            </div>
+                            <div>
+                                <label for="password" class="block text-sm font-medium text-gray-300 mb-1">Change Password</label>
+                                <input type="password" id="password" placeholder="Enter new password"
+                                    class="w-full p-2 rounded-lg text-sm">
+                            </div>
+                            <button class="px-4 py-2 btn-primary rounded-full">Save Account Settings</button>
+                        </form>
+                    </div>
+
+                    <div class="neon-glow-card p-6 rounded-3xl">
+                        <h3 class="text-xl font-bold mb-4 border-b border-primary-blue/50 pb-2 text-primary-blue">Camera Management (${cameras.length} connected)</h3>
+                        <div class="space-y-3 mb-4">
+                            ${renderCamerasList()}
+                        </div>
+                        <button onclick="handleNavigation('add-camera')" class="px-4 py-2 btn-primary rounded-full">Add New Camera</button>
+                    </div>
+
+                    <div class="neon-glow-card p-6 rounded-3xl">
+                        <h3 class="text-xl font-bold mb-4 border-b border-primary-blue/50 pb-2 text-primary-blue">Notification Settings</h3>
+                        <div class="space-y-4">
+                            <div class="flex items-center justify-between">
+                                <label for="critical-alerts" class="text-gray-300">Send instant mobile notifications (Critical)</label>
+                                <input type="checkbox" id="critical-alerts" checked class="h-5 w-5 rounded text-primary focus:ring-primary bg-gray-600 border-gray-500">
+                            </div>
+                            <div class="flex items-center justify-between">
+                                <label for="email-alerts" class="text-gray-300">Send behavior summary reports via email</label>
+                                <input type="checkbox" id="email-alerts" checked class="h-5 w-5 rounded text-primary focus:ring-primary bg-gray-600 border-gray-500">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="neon-glow-card p-6 rounded-3xl">
+                        <h3 class="text-xl font-bold mb-4 border-b border-primary-blue/50 pb-2 text-primary-blue">AI and Alert Settings</h3>
+                        <form class="space-y-4">
+                            <div class="border-b border-gray-700 pb-4">
+                                <h4 class="text-lg font-semibold text-white mb-2">AI Model Settings</h4>
+                                <div>
+                                    <label for="sensitivity" class="block text-sm font-medium text-gray-300">Harmful Behavior Detection Sensitivity (Model Sensitivity):</label>
+                                    <input type="range" id="sensitivity" min="1" max="100" value="75" class="w-full h-2 bg-gray-600 rounded-lg appearance-none cursor-pointer range-lg mt-2 accent-blue-500">
+                                    <p class="text-xs text-gray-500 mt-1">Current Value: <span id="sensitivity-value">75</span>%</p>
+                                </div>
+                            </div>
+                            
+                            <div class="border-b border-gray-700 pb-4">
+                                <h4 class="text-lg font-semibold text-white mb-2">Integration and Alert Settings (Alert Engine)</h4>
+                                <div>
+                                    <label for="alertEmail" class="block text-sm font-medium text-gray-300">Instant Alert Email:</label>
+                                    <input type="email" id="alertEmail" value="admin@vigive.com" class="mt-1 block w-full p-3 border rounded-lg text-gray-100">
+                                </div>
+                                <div class="mt-4">
+                                    <label class="inline-flex items-center">
+                                        <input type="checkbox" checked class="form-checkbox h-5 w-5 text-blue-600 bg-gray-700 border-gray-600 rounded accent-blue-500">
+                                        <span class="ml-2 text-gray-300">Enable automatic security notification for "harmful" behavior</span>
+                                    </label>
+                                </div>
+                            </div>
+
+                            <button type="submit" class="w-full btn-primary rounded-full shadow-lg">Save Settings</button>
+                        </form>
+                    </div>
+                </div>
+            `;
+        }
+
+        function getSettingsHTML() {
+            return `
+        <div class="max-w-4xl mx-auto space-y-8">
+            <h2 class="text-3xl font-bold text-white border-b border-primary-blue/50 pb-2 mb-6">System Settings</h2>
+
+            <div class="neon-glow-card p-6 rounded-3xl">
+                <p class="text-gray-400">Cloud service integration details are managed via a secure server and not through the user interface. This display focuses on user experience and the demo.</p>
+            </div>
+
+            ${getOriginalSettingsContent()}
+        </div>
+    `;
+        }
+
+        function getAddCameraHTML() {
+            return `
+                <div class="max-w-2xl mx-auto space-y-8">
+                    <h2 class="text-3xl font-bold text-white border-b border-primary-blue/50 pb-2 mb-6">Add New Camera</h2>
+                    
+                    <div class="neon-glow-card p-6 rounded-3xl">
+                        <h3 class="text-xl font-bold mb-4 border-b border-primary-blue/50 pb-2 text-primary-blue">Camera Data</h3>
+                        <form class="space-y-4">
+                            <div>
+                                <label for="cam-name" class="block text-sm font-medium text-gray-300 mb-1">Camera Name (e.g., Main Entrance)</label>
+                                <input type="text" id="cam-name" placeholder="Enter camera name" required
+                                    class="w-full p-2 rounded-lg text-sm">
+                            </div>
+                            <div>
+                                <label for="cam-rtsp" class="block text-sm font-medium text-gray-300 mb-1">RTSP Stream URL / URL (Video Address)</label>
+                                <input type="text" id="cam-rtsp" placeholder="rtsp://..." required
+                                    class="w-full p-2 rounded-lg text-sm" value="rtsp://placeholder:80/stream">
+                            </div>
+                            <div>
+                                <label for="cam-location" class="block text-sm font-medium text-gray-300 mb-1">Physical Location</label>
+                                <input type="text" id="cam-location" placeholder="Meeting Room, Corridor 3"
+                                    class="w-full p-2 rounded-lg text-sm">
+                            </div>
+                            
+                            <h4 class="font-bold text-gray-300 pt-2">AI Settings</h4>
+                            <div class="flex items-center justify-between p-3 bg-gray-900/50 rounded-lg border border-primary-blue/30">
+                                <label for="ai-active" class="text-gray-300">Enable Smart Behavior Analysis</label>
+                                <input type="checkbox" id="ai-active" checked class="h-5 w-5 rounded text-primary focus:ring-primary bg-gray-600 border-gray-500">
+                            </div>
+
+                            <button type="button" onclick="alert('Camera added successfully!')"
+                                class="w-full btn-primary rounded-full">
+                                Save and Add Camera
+                            </button>
+                        </form>
+                        <p class="mt-4 text-xs text-gray-500 text-center">
+                            Ensure the camera is connected to the network before adding.
+                        </p>
+                    </div>
+                </div>
+            `;
+        }
+        
+        function getBranchPageHTML(branchKey) {
+            const data = branchData[branchKey];
+            if (!data) return `<div class="text-center py-20"><h2 class="text-4xl text-red-500">404 - Branch Not Found</h2></div>`;
+            
+            return `
+                <div class="max-w-6xl mx-auto space-y-8">
+                    <h2 class="text-3xl font-bold text-white border-b border-primary-blue/50 pb-2 mb-6">${data.title}</h2>
+                    
+                    <div class="neon-glow-card p-6 rounded-3xl">
+                        <div class="space-y-4">
+                            <div class="p-4 bg-blue-900/50 rounded-lg border-r-4 border-primary-blue">
+                                <p class="font-bold text-xl text-primary-blue">${data.title}</p>
+                                <p class="text-sm text-gray-400 mt-1">Primary Focus: ${data.keyFocus}</p>
+                            </div>
+
+                            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                <div class="p-4 bg-gray-900/50 rounded-3xl text-center shadow-inner">
+                                    <p class="text-sm text-gray-400">Total Alerts (24h)</p>
+                                    <p class="text-3xl font-extrabold text-white">${data.alerts}</p>
+                                </div>
+                                <div class="p-4 bg-gray-900/50 rounded-3xl text-center shadow-inner">
+                                    <p class="text-sm text-gray-400">Harmful Behaviors (Dangerous)</p>
+                                    <p class="text-3xl font-extrabold text-red-400">${data.dangerous}</p>
+                                </div>
+                                <div class="p-4 bg-gray-900/50 rounded-3xl text-center shadow-inner">
+                                    <p class="text-sm text-gray-400">Suspicious Behaviors (Suspicious)</p>
+                                    <p class="text-3xl font-extrabold text-yellow-400">${data.suspicious}</p>
+                                </div>
+                            </div>
+
+                            <h5 class="text-xl font-bold mt-6 text-gray-200 border-b border-primary-blue/50 pb-2">Live Camera Streams (${branchKey})</h5>
+                            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                                ${[1, 2, 3, 4].map(i => `
+                                    <div class="neon-glow-card p-3 rounded-xl shadow-md cursor-pointer hover:bg-gray-700/50 transition" 
+                                         onclick="openCameraModal('Camera ${i} - ${data.title.split(' ')[0]}')">
+                                        <p class="text-md font-semibold text-white truncate">Camera ${i}</p>
+                                        <p class="text-sm ${i % 3 === 0 ? 'text-red-400' : 'text-green-400'}">Status: ${i % 3 === 0 ? 'Harmful' : 'Normal'}</p>
+                                    </div>
+                                `).join('')}
+                            </div>
+                            
+                            <div class="mt-8">
+                                <h5 class="text-xl font-bold text-gray-200 border-b border-primary-blue/50 pb-2">Additional Statistics</h5>
+                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                                    <div class="bg-gray-900/50 p-4 rounded-3xl border border-primary-blue/30">
+                                        <p class="text-sm text-gray-400">Average Response Time</p>
+                                        <p class="text-2xl font-bold text-white">${Math.floor(Math.random() * 10) + 2} seconds</p>
+                                    </div>
+                                    <div class="bg-gray-900/50 p-4 rounded-3xl border border-primary-blue/30">
+                                        <p class="text-sm text-gray-400">Detection Accuracy Rate</p>
+                                        <p class="text-2xl font-bold text-green-400">${Math.floor(Math.random() * 10) + 90}%</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function getAboutHTML() {
+            return `
+                <div class="max-w-4xl mx-auto space-y-6">
+                    <h2 class="text-3xl font-bold text-white border-b border-primary-blue/50 pb-2 mb-4">About the System</h2>
+                    <div class="p-4 bg-gray-900/50 rounded-3xl border border-primary-blue/30">
+                        <h3 class="font-bold text-white mb-2">Purpose</h3>
+                        <p class="text-gray-300">VIGIYE is an intelligent surveillance platform designed to detect suspicious and harmful behaviors in commercial and residential environments using a combination of camera streams, intelligent analytics, and cloud computing services.</p>
+                    </div>
+
+                    <div class="p-4 bg-gray-900/50 rounded-3xl border border-primary-blue/30">
+                        <h3 class="font-bold text-white mb-2">Technologies Used</h3>
+                        <ul class="list-disc list-inside text-gray-300">
+                            <li>HTML5 + Tailwind CSS (flexible and fast interface)</li>
+                            <li>JavaScript (interactive interface and rendering operations)</li>
+                            <li>Huawei Cloud (OBS, ML Kit, ModelArts) — conditional integration via interface or through an intermediate server</li>
+                        </ul>
+                    </div>
+
+                    <div class="p-4 bg-gray-900/50 rounded-3xl border border-primary-blue/30">
+                        <h3 class="font-bold text-white mb-2">Huawei Services Used (mentioned for review)</h3>
+                        <p class="text-gray-300">OBS (Object Storage) for report storage, ModelArts for AI processing, ML Kit for web-based intelligence testing, and HoloSens for connecting smart camera devices.</p>
+                    </div>
+
+                    <div class="p-4 bg-gray-900/50 rounded-3xl border border-primary-blue/30">
+                        <h3 class="font-bold text-white mb-2">Behavior Analysis Methodology</h3>
+                        <p class="text-gray-300">We use analytics pipelines based on behavioral classification models to extract events (aggressive, suspicious, theft, motion-anomaly) from video data. In this demo, the demo mode has been separated from real integration to illustrate the concept without the need for real keys in the interface.</p>
+                    </div>
+                </div>
+            `;
+        }
+
+        const showLoadingIndicator = () => {
+            const loader = document.getElementById('video-loading');
+            if (loader) loader.classList.remove('hidden');
+        };
+        
+        const hideLoadingIndicator = () => {
+            const loader = document.getElementById('video-loading');
+            if (loader) loader.classList.add('hidden');
+        };
+        
+        const initLiveStream = (cameraId) => {
+            const video = document.getElementById('modal-video');
+            if (!video) return;
+            
+            video.addEventListener('loadstart', () => {
+                showLoadingIndicator();
+            }, { once: false });
+            
+            video.addEventListener('canplay', () => {
+                hideLoadingIndicator();
+            }, { once: false });
+            
+            video.addEventListener('error', (e) => {
+                console.error('Video playback error:', e);
+                hideLoadingIndicator();
+            });
+        };
+        
+        window.onload = () => {
+            renderPage('login');
+            window.initializeHuaweiCloud();
+            
+            document.addEventListener('input', (e) => {
+                if (e.target && e.target.id === 'sensitivity') {
+                    const valueEl = document.getElementById('sensitivity-value');
+                    if (valueEl) valueEl.textContent = e.target.value;
+                }
+            });
+            if (typeof DEMO_MODE !== 'undefined' && DEMO_MODE) {
+                const demoBadge = document.getElementById('demo-badge');
+                if (demoBadge) demoBadge.classList.remove('hidden');
+            }
+        };
+
+    </script>
+
+    <footer class="mt-12 pt-8 border-t border-gray-700 text-center text-gray-500 text-sm">
+        <p>VIGIYE - Intelligent Surveillance System</p>
+        <p class="flex items-center justify-center gap-2 mt-2">
+            <span>Powered by</span>
+            <strong class="text-red-500">Huawei</strong>
+            <span>Cloud & AI Services</span>
+        </p>
+    </footer>
+</body>
+</html>
